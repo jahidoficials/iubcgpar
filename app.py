@@ -63,43 +63,75 @@ def _secret(name, default=""):
         return default
 
 def persist_company_to_github(company_name, address_lines):
-    """Persist a company into companies.json in the GitHub repo backing the app.
+    """Add/update a company in the GitHub-backed companies.json.
 
-    Expected Streamlit secrets:
-      GITHUB_TOKEN, GITHUB_REPO (owner/repo)
-    Optional:
-      GITHUB_BRANCH (default: main), GITHUB_COMPANIES_PATH (default: companies.json)
+    Reads the file from the GitHub Contents API first. If GitHub returns 404,
+    it falls back to the public raw file URL for reading (useful when the repo
+    is public and the PAT has a scope/configuration problem). Writing still
+    requires a valid token with permission to the repository.
     """
     token = _secret("GITHUB_TOKEN")
-    repo = _secret("GITHUB_REPO")
+    repo = _secret("GITHUB_REPO", "jahidofficials/iubcgpar")
     branch = _secret("GITHUB_BRANCH", "main") or "main"
     json_path = _secret("GITHUB_COMPANIES_PATH", "companies.json") or "companies.json"
 
-    if not token or not repo:
+    # Clean common copy/paste mistakes in Secrets.
+    repo = repo.strip().strip("/")
+    json_path = json_path.strip().lstrip("/")
+    branch = branch.strip()
+
+    if "://" in repo or repo.count("/") != 1:
         return False, (
-            "GitHub persistence is not configured yet. Add GITHUB_TOKEN and "
-            "GITHUB_REPO in Streamlit App → Settings → Secrets."
+            "Invalid GITHUB_REPO. It must be exactly: owner/repository "
+            "(for example: jahidofficials/iubcgpar)."
         )
 
     api_url = f"https://api.github.com/repos/{repo}/contents/{json_path}"
     headers = {
-        "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    payload = None
+    current_content = None
 
     try:
+        # First try GitHub's Contents API.
         get_response = requests.get(
             api_url, headers=headers, params={"ref": branch}, timeout=20
         )
-        if get_response.status_code != 200:
-            return False, f"Could not read companies.json from GitHub ({get_response.status_code})."
+        if get_response.status_code == 200:
+            payload = get_response.json()
+            current_content = base64.b64decode(payload["content"]).decode("utf-8")
+        elif get_response.status_code == 404:
+            # Public-repo fallback: read the exact file directly.
+            raw_url = f"https://raw.githubusercontent.com/{repo}/{branch}/{json_path}"
+            raw_response = requests.get(raw_url, timeout=20)
+            if raw_response.status_code == 200:
+                current_content = raw_response.text
+            else:
+                return False, (
+                    f"GitHub could not find {json_path} on branch '{branch}'. "
+                    f"Checked repository '{repo}'. API={get_response.status_code}, "
+                    f"raw={raw_response.status_code}."
+                )
+        else:
+            msg = ""
+            try:
+                msg = get_response.json().get("message", "")
+            except Exception:
+                pass
+            return False, (
+                f"GitHub read failed ({get_response.status_code})" +
+                (f": {msg}" if msg else ".")
+            )
 
-        payload = get_response.json()
-        current_content = base64.b64decode(payload["content"]).decode("utf-8")
         github_data = json.loads(current_content)
+        if not isinstance(github_data, dict):
+            return False, "companies.json must contain a JSON object/dictionary."
 
-        # Avoid creating a second key that differs only by capitalization.
         existing_name = next(
             (name for name in github_data if name.casefold() == company_name.casefold()),
             None,
@@ -109,6 +141,32 @@ def persist_company_to_github(company_name, address_lines):
 
         github_data[company_name] = address_lines
         new_content = json.dumps(github_data, ensure_ascii=False, indent=2) + "\n"
+
+        # A valid Contents-API payload (including SHA) is required to write.
+        if not token:
+            return False, (
+                "Company data can be read, but GITHUB_TOKEN is missing. "
+                "Add a GitHub token in Streamlit Secrets to save changes."
+            )
+
+        # If the API GET was successful, use its SHA. If we had to use raw
+        # fallback, fetch the Contents API once more to obtain the SHA.
+        if not payload or "sha" not in payload:
+            get_for_sha = requests.get(
+                api_url, headers=headers, params={"ref": branch}, timeout=20
+            )
+            if get_for_sha.status_code != 200:
+                detail = ""
+                try:
+                    detail = get_for_sha.json().get("message", "")
+                except Exception:
+                    pass
+                return False, (
+                    f"GitHub file read for saving failed ({get_for_sha.status_code})" +
+                    (f": {detail}" if detail else ".") +
+                    " Check that GITHUB_TOKEN has access to the repository."
+                )
+            payload = get_for_sha.json()
 
         put_payload = {
             "message": f"Add/update company: {company_name}",
@@ -125,35 +183,18 @@ def persist_company_to_github(company_name, address_lines):
                 detail = put_response.json().get("message", "")
             except Exception:
                 pass
-            return False, f"GitHub save failed ({put_response.status_code}). {detail}".strip()
+            return False, (
+                f"GitHub save failed ({put_response.status_code})" +
+                (f": {detail}" if detail else ".") +
+                " Make sure the token can write to this repository."
+            )
 
-        return True, company_name
-    except Exception as exc:
-        return False, f"GitHub save failed: {exc}"
+        return True, f"{company_name} saved to GitHub."
 
-OFFICIALS = {
-    "Director": {
-        "name": "Manjurul Haque Khan",
-        "title": "Director",
-        "phone": "01883498080",
-        "email": "director.cgpar@iub.edu.bd",
-        "show_phone": True,
-    },
-    "Deputy Director": {
-        "name": "Sharmeen Islam",
-        "title": "Deputy Director",
-        "phone": "01709963681",
-        "email": "cgp@iub.edu.bd",
-        "show_phone": False,
-    },
-    "Senior Analyst": {
-        "name": "Md.Hasanuzzaman",
-        "title": "Senior Analyst (Senior Officer)",
-        "phone": "01736692582",
-        "email": "cgp@iub.edu.bd",
-        "show_phone": True,
-    },
-}
+    except requests.RequestException as exc:
+        return False, f"GitHub connection error: {exc}"
+    except (ValueError, KeyError, UnicodeDecodeError) as exc:
+        return False, f"Could not process companies.json: {exc}"
 
 def classify_student(record):
     reg = str(record.get("register", "")).strip()
